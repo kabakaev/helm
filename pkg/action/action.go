@@ -153,6 +153,13 @@ func (c *Configuration) renderResources(ch *chart.Chart, values chartutil.Values
 	}
 	notes := notesBuffer.String()
 
+	if pr != nil {
+		files, err = postProcessFiles(files, pr)
+		if err != nil {
+			return hs, b, notes, err
+		}
+	}
+
 	// Sort hooks, manifests, and partials. Only hooks and manifests are returned,
 	// as partials are not used after renderer.Render. Empty manifests are also
 	// removed here.
@@ -209,14 +216,112 @@ func (c *Configuration) renderResources(ch *chart.Chart, values chartutil.Values
 		}
 	}
 
-	if pr != nil {
-		b, err = pr.Run(b)
-		if err != nil {
-			return hs, b, notes, errors.Wrap(err, "error while running post render on files")
+	return hs, b, notes, nil
+}
+
+// postProcessFiles sends files for post-processing.
+// Some post-processing may need all objects at once.
+// Therefore we concatenate all rendered files, post-process and split them back.
+// A temporary annotation is added to preserve template filename.
+func postProcessFiles(files map[string]string, pr postrender.PostRenderer) (map[string]string, error) {
+	if pr == nil {
+		return files, nil
+	}
+
+	annotationName := "helmPostProcessFileName"
+
+	b := bytes.NewBuffer(nil)
+
+	// Split the rendered files into documents and add the temp annotation.
+	reYamlDocumentSeparator := regexp.MustCompile(`\n---\s*\n`)
+	for fileName, fileContent := range files {
+		for _, document := range reYamlDocumentSeparator.Split(fileContent, -1) {
+			if strings.TrimSpace(document) == "" {
+				continue
+			}
+			b.WriteString("---\n")
+			documentYaml, _, err := yamlSetTemporaryAnnotation(document, annotationName, fileName)
+			if err != nil {
+				return nil, fmt.Errorf("cannot prepare a file for post-process: %w", err)
+			}
+			b.Write(documentYaml)
 		}
 	}
 
-	return hs, b, notes, nil
+	// Run post-processing.
+	b, err := pr.Run(b)
+	if err != nil {
+		return nil, errors.Wrap(err, "error while running post render on files")
+	}
+
+	postProcessedFiles := make(map[string]string)
+	// Split the post-processed stream into files.
+	for _, document := range strings.Split(b.String(), "---\n") {
+		if strings.TrimSpace(document) == "" {
+			continue
+		}
+		document, fileName, err := yamlSetTemporaryAnnotation(document, annotationName, "")
+		if err != nil {
+			return nil, fmt.Errorf("cannot reconstruct a file after post-process: %w", err)
+		}
+		existingDocument, ok := postProcessedFiles[fileName]
+		if ok {
+			postProcessedFiles[fileName] = existingDocument + "\n---\n" + string(document)
+		} else {
+			postProcessedFiles[fileName] = string(document)
+		}
+	}
+
+	return postProcessedFiles, nil
+}
+
+// yamlSetTemporaryAnnotation adds or cuts out an annotation text in yaml kubernetess object
+func yamlSetTemporaryAnnotation(document, annotationName, annotationValue string) ([]byte, string, error) {
+	// Unmarshal the document.
+	var documentMap map[string]interface{}
+	err := yaml.Unmarshal([]byte(document), &documentMap)
+	if err != nil {
+		return nil, "", err
+	}
+
+	// Take the annotations map.
+	metadata, ok := documentMap["metadata"].(map[string]interface{})
+	if !ok {
+		return nil, "", fmt.Errorf("document has no metadata: %s", document)
+	}
+
+	annotations, ok := metadata["annotations"].(map[string]interface{})
+
+	// Add or remove the annotation.
+	if annotationValue == "" && ok {
+		// Cut annotation.
+		annotationValue, ok = annotations[annotationName].(string)
+		if !ok {
+			return nil, "", fmt.Errorf("annotation %s value is not a string: %v", annotationName, annotations[annotationName])
+		}
+		delete(annotations, annotationName)
+	} else if annotationValue == "" {
+		// Nothing to remove. Either post-renderer removed the annotation
+		// or a new k8s object was added without such annotation.
+		// Let's add a fake file name.
+		annotationValue = "non-existent.yaml"
+	} else {
+		// Add annotation.
+		if !ok {
+			annotations = make(map[string]interface{})
+		}
+		annotations[annotationName] = annotationValue
+	}
+
+	metadata["annotations"] = annotations
+	documentMap["metadata"] = metadata
+
+	documentYaml, err := yaml.Marshal(documentMap)
+	if err != nil {
+		return nil, "", fmt.Errorf("cannot marshal a yaml document: %v", err)
+	}
+
+	return documentYaml, annotationValue, nil
 }
 
 // RESTClientGetter gets the rest client
